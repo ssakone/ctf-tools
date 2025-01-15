@@ -1,0 +1,6 @@
+netifaces
+tabulate
+scapy
+requests
+tqdm
+rich
