@@ -8,3 +8,4 @@ aiohttp==3.9.1
 flask==3.0.0
 pytest==8.3.4
 colorama==0.4.6
+pytest-asyncio
