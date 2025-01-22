@@ -44,6 +44,18 @@ python web_brute.py -w wordlist.txt -u http://target.com/ --include-status 200 3
 # Filter by response size
 python web_brute.py -w wordlist.txt -u http://target.com/ --exclude-size 0
 
+### Examples with Prefix/Suffix
+```bash
+# Find PHP files
+python web_brute.py -w wordlist.txt -u http://target.com --suffix ".php"
+
+# Find admin paths
+python web_brute.py -w wordlist.txt -u http://target.com --prefix "admin_"
+
+# Combined prefix and suffix
+python web_brute.py -w wordlist.txt -u http://target.com --prefix "page_" --suffix ".html"
+```
+
 ---
 
 -w, --wordlist     Path to wordlist file

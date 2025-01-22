@@ -15,6 +15,8 @@ import itertools
 import string
 import re
 import asyncio
+import signal
+from datetime import datetime
 
 colorama.init()  # For Windows ANSI color support
 
@@ -43,7 +45,7 @@ class WordlistGenerator:
         charset = ''.join(self.charsets[c] for c in chars)
         return (''.join(p) for p in itertools.product(charset, repeat=int(length)))
 
-def parse_args():
+def parse_args(args=None):
     parser = argparse.ArgumentParser(
         description="Optimized multithreaded brute-forcer for website routes/files, streaming large wordlists."
     )
@@ -76,6 +78,8 @@ def parse_args():
     parser.add_argument("-H", "--headers", help="Path to headers file (JSON format)")
     parser.add_argument("--brute-headers", action="store_true", 
                         help="Enable header bruteforcing")
+    parser.add_argument("--data-pattern", help="Pattern for data bruteforcing (e.g. {'user':'[a]{3}'})")
+    parser.add_argument("--data-wordlist", help="Wordlist file for data bruteforcing")
 
     # -----------------------------
     # FILTERS: Include / Exclude
@@ -96,7 +100,7 @@ def parse_args():
     parser.add_argument("-v", "--verbose", action="store_true",
         help="Verbose mode (debug logs).")
 
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 def passes_filter(value, include_list, exclude_list):
     """
@@ -180,55 +184,124 @@ def worker(url, filters, verbose=False):
 
 async def make_request(session, url: str, method: str = "GET", 
                       data: Optional[Dict] = None, 
-                      headers: Optional[Dict] = None) -> dict:
+                      headers: Optional[Dict] = None,
+                      timeout: int = 10) -> dict:
     try:
         async with session.request(method=method, url=url, 
-                                 json=data, headers=headers) as response:
-            content_length = len(await response.read())
+                                 json=data, headers=headers,
+                                 timeout=timeout) as response:
+            content = await response.read()
             return {
                 "url": url,
-                "status_code": response.status,
-                "content_length": content_length,
-                "is_valid": response.status != 404
+                "status": response.status,
+                "length": len(content),
+                "timestamp": datetime.now().isoformat()
             }
+    except asyncio.TimeoutError:
+        print(f"[TIMEOUT] {url}")
+        return None
     except Exception as e:
-        return {
-            "url": url,
-            "status_code": 0,
-            "content_length": 0,
-            "is_valid": False,
-            "error": str(e)
-        }
+        print(f"[ERROR] {url}: {str(e)}")
+        return None
 
-async def main():
-    args = parse_args()
+def generate_data_payloads(pattern: str, generator: WordlistGenerator) -> Iterator[Dict]:
+    """Generate data payloads from pattern or literal values."""
+    try:
+        template = json.loads(pattern)
+        # We’ll try for each key. If it’s a pattern "[a]{1}", generate permutations.
+        # Else, yield the literal value once.
+        keys = list(template.keys())
+        # Build up all possible permutations of pattern/literal
+        # but keep it simple by iterating on each key:
+        records = [template]  # Start with one “base” record
+        new_records = []
+
+        for key in keys:
+            val = template[key]
+            if isinstance(val, str) and val.startswith('[') and val.endswith(']'):
+                # Real pattern, expand
+                words = generator.parse_pattern(val)
+                for wrd in words:
+                    for rec in records:
+                        new_rec = dict(rec)
+                        new_rec[key] = wrd
+                        new_records.append(new_rec)
+                records = new_records
+                new_records = []
+            else:
+                # Literal value, keep it as-is
+                # i.e., we just leave it in `records` unchanged
+                pass
+
+        for r in records:
+            yield r
+    except json.JSONDecodeError:
+        print("[!] Invalid JSON pattern for data")
+        return
+
+async def main(args=None):
+    if args is None:
+        args = parse_args()
+    else:
+        args = parse_args(args)
+    
+    # Setup signal handler
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    
+    print(f"[*] Starting web brute force against {args.url}")
+    print(f"[*] Method: {args.method}")
+    print(f"[*] Threads: {args.threads}")
+    
     generator = WordlistGenerator()
     
-    # Get words iterator based on source
-    if args.wordlist:
-        words = (line.strip() for line in open(args.wordlist, encoding='utf-8'))
-    else:
-        words = generator.parse_pattern(args.pattern)
-        
+    # Generate URL paths
+    if args.pattern:
+        paths = list(generator.parse_pattern(args.pattern))
+    elif args.wordlist:
+        with open(args.wordlist) as f:
+            paths = [line.strip() for line in f]
+    
+    # Generate data payloads
+    data_payloads = [None]  # Default no data
+    if args.data_pattern:
+        data_payloads = list(generate_data_payloads(args.data_pattern, generator))
+    elif args.data_wordlist:
+        with open(args.data_wordlist) as f:
+            data_payloads = [json.loads(line.strip()) for line in f]
+    
+    if args.verbose:
+        print(f"[*] Generated {len(paths)} paths to test")
+    
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for word in words:
-            if not word:
-                continue
-            url = f"{args.url}{args.prefix}{word}{args.suffix}"
-            tasks.append(make_request(session, url))
-            
-        results = await asyncio.gather(*tasks)
-        # Process results...
+        with tqdm(total=len(paths), desc="Progress", disable=not args.verbose) as pbar:
+            for path in paths:
+                for data in data_payloads:
+                    # Update URL construction with prefix/suffix
+                    url = f"{args.url}/{args.prefix}{path}{args.suffix}"
+                    task = asyncio.create_task(make_request(session, url, 
+                                                          method=args.method, data=data))
+                    tasks.append(task)
+                    if args.verbose:
+                        print(f"[+] Testing: {url} with data: {data}")
+                    
+            results = await asyncio.gather(*tasks)
+            for result in results:
+                if result:
+                    pbar.update(1)
+                    if args.verbose:
+                        print(f"[+] Found: {result['url']} "
+                              f"(Status: {result['status']}, "
+                              f"Length: {result['length']})")
+    return results  # Add return for test validation
 
 if __name__ == "__main__":
     try:
-        # Run async main with proper event loop
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[!] User interrupted. Exiting.")
+        print("\n[!] Interrupted by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\n[!] Error: {e}")
+        print(f"\n[!] Error: {str(e)}")
         sys.exit(1)
 
