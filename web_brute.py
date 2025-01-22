@@ -8,23 +8,56 @@ import requests
 import colorama
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
+import json
+from typing import Dict, Optional, Iterator
+import aiohttp
+import itertools
+import string
+import re
+import asyncio
+import signal
+from datetime import datetime
 
 colorama.init()  # For Windows ANSI color support
 
 GREEN = "\033[92m"
 RESET = "\033[0m"
 
-def parse_args():
+class WordlistGenerator:
+    def __init__(self):
+        self.charsets = {
+            'a': string.ascii_lowercase,
+            'A': string.ascii_uppercase,
+            'd': string.digits,
+            's': string.punctuation
+        }
+    
+    def parse_pattern(self, pattern: str) -> Iterator[str]:
+        """Parse patterns like: [a]{3} for 3 lowercase letters"""
+        if not pattern or len(pattern) < 4:  # Minimum pattern: [x]{1}
+            raise ValueError("Invalid pattern format")
+            
+        match = re.match(r'\[([aAds]+)\]\{(\d+)\}', pattern)
+        if not match:
+            raise ValueError("Pattern must be in format: [chars]{length}")
+            
+        chars, length = match.groups()
+        charset = ''.join(self.charsets[c] for c in chars)
+        return (''.join(p) for p in itertools.product(charset, repeat=int(length)))
+
+def parse_args(args=None):
     parser = argparse.ArgumentParser(
         description="Optimized multithreaded brute-forcer for website routes/files, streaming large wordlists."
     )
+    
+    # Create mutually exclusive group for wordlist source
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("-w", "--wordlist", help="Path to wordlist file")
+    source_group.add_argument("-p", "--pattern", help="Pattern for wordlist generation (e.g. [a]{3})")
+    
     parser.add_argument(
         "-u", "--url", required=True,
         help="Base URL, e.g., http://alert.htb/index.php?page="
-    )
-    parser.add_argument(
-        "-w", "--wordlist", required=True,
-        help="Path to the (large) wordlist file."
     )
     parser.add_argument(
         "--prefix", default="",
@@ -38,6 +71,15 @@ def parse_args():
         "-t", "--threads", type=int, default=5,
         help="Number of threads (default: 5)."
     )
+    parser.add_argument("-m", "--method", default="GET", 
+                        choices=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"],
+                        help="HTTP method to use")
+    parser.add_argument("-d", "--data", help="Request body data (JSON format)")
+    parser.add_argument("-H", "--headers", help="Path to headers file (JSON format)")
+    parser.add_argument("--brute-headers", action="store_true", 
+                        help="Enable header bruteforcing")
+    parser.add_argument("--data-pattern", help="Pattern for data bruteforcing (e.g. {'user':'[a]{3}'})")
+    parser.add_argument("--data-wordlist", help="Wordlist file for data bruteforcing")
 
     # -----------------------------
     # FILTERS: Include / Exclude
@@ -58,7 +100,7 @@ def parse_args():
     parser.add_argument("-v", "--verbose", action="store_true",
         help="Verbose mode (debug logs).")
 
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 def passes_filter(value, include_list, exclude_list):
     """
@@ -140,104 +182,126 @@ def worker(url, filters, verbose=False):
         "reason": reason
     }
 
-def main():
-    args = parse_args()
-
-    # Build filters dict
-    filters = {
-        "inc_status": set(args.include_status),
-        "exc_status": set(args.exclude_status),
-        "inc_size": set(args.include_size),
-        "exc_size": set(args.exclude_size),
-        "inc_contains": args.include_contains,
-        "exc_contains": args.exclude_contains
-    }
-
-    if not os.path.isfile(args.wordlist):
-        print(f"[!] Wordlist not found: {args.wordlist}")
-        sys.exit(1)
-
-    # We'll do a quick pass to count lines so we can show a proper total in tqdm.
-    print("[*] Counting lines in wordlist (one-time pass).")
+async def make_request(session, url: str, method: str = "GET", 
+                      data: Optional[Dict] = None, 
+                      headers: Optional[Dict] = None,
+                      timeout: int = 10) -> dict:
     try:
-        total_lines = 0
-        with open(args.wordlist, "r", encoding="utf-8", errors="ignore") as fcount:
-            for _ in fcount:
-                total_lines += 1
-    except KeyboardInterrupt:
-        print("\n[!] User interrupted during counting. Exiting.")
-        sys.exit(1)
+        async with session.request(method=method, url=url, 
+                                 json=data, headers=headers,
+                                 timeout=timeout) as response:
+            content = await response.read()
+            return {
+                "url": url,
+                "status": response.status,
+                "length": len(content),
+                "timestamp": datetime.now().isoformat()
+            }
+    except asyncio.TimeoutError:
+        print(f"[TIMEOUT] {url}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] {url}: {str(e)}")
+        return None
 
-    if args.verbose:
-        print(f"[+] Found {total_lines} lines in {args.wordlist}.")
-        print(f"[+] Using {args.threads} threads.")
-        print("[+] Filters:")
-        print(f"    - include status: {filters['inc_status']} | exclude status: {filters['exc_status']}")
-        print(f"    - include size:   {filters['inc_size']}  | exclude size:   {filters['exc_size']}")
-        print(f"    - include substr: {filters['inc_contains']} | exclude substr: {filters['exc_contains']}")
-        print()
-
-    print(f"[*] Starting brute force against: {args.url}")
-    valid_results = []
-
-    # Producer-Consumer approach:
-    # We'll open the file again and stream lines, never queuing
-    # more futures than 'args.threads' at once.
+def generate_data_payloads(pattern: str, generator: WordlistGenerator) -> Iterator[Dict]:
+    """Generate data payloads from pattern or literal values."""
     try:
-        with ThreadPoolExecutor(max_workers=args.threads) as executor, \
-             open(args.wordlist, "r", encoding="utf-8", errors="ignore") as f, \
-             tqdm(total=total_lines, desc="Processing", unit="URL") as pbar:
+        template = json.loads(pattern)
+        # We’ll try for each key. If it’s a pattern "[a]{1}", generate permutations.
+        # Else, yield the literal value once.
+        keys = list(template.keys())
+        # Build up all possible permutations of pattern/literal
+        # but keep it simple by iterating on each key:
+        records = [template]  # Start with one “base” record
+        new_records = []
 
-            futures = []
-            for line in f:
-                w = line.strip()
-                if not w:
-                    pbar.update(1)
-                    continue
+        for key in keys:
+            val = template[key]
+            if isinstance(val, str) and val.startswith('[') and val.endswith(']'):
+                # Real pattern, expand
+                words = generator.parse_pattern(val)
+                for wrd in words:
+                    for rec in records:
+                        new_rec = dict(rec)
+                        new_rec[key] = wrd
+                        new_records.append(new_rec)
+                records = new_records
+                new_records = []
+            else:
+                # Literal value, keep it as-is
+                # i.e., we just leave it in `records` unchanged
+                pass
 
-                brute_url = f"{args.url}{args.prefix}{w}{args.suffix}"
+        for r in records:
+            yield r
+    except json.JSONDecodeError:
+        print("[!] Invalid JSON pattern for data")
+        return
 
-                # If we already have 'threads' futures in flight, wait for at least one to finish
-                while len(futures) >= args.threads:
-                    done, not_done = wait(futures, return_when=FIRST_COMPLETED)
-                    for d in done:
-                        res = d.result()
-                        pbar.update(1)
-                        futures.remove(d)  # remove from the main list
-
-                        if res["is_valid"]:
-                            print(f"{GREEN}[+] {res['url']} => {res['status_code']} (size: {res['content_length']}){RESET}")
-                            valid_results.append(res)
-
-                # Submit a new job
-                futures.append(executor.submit(worker, brute_url, filters, args.verbose))
-
-            # After reading all lines, wait for leftover futures
-            while futures:
-                done, not_done = wait(futures, return_when=FIRST_COMPLETED)
-                for d in done:
-                    res = d.result()
-                    pbar.update(1)
-                    futures.remove(d)
-
-                    if res["is_valid"]:
-                        print(f"{GREEN}[+] {res['url']} => {res['status_code']} (size: {res['content_length']}){RESET}")
-                        valid_results.append(res)
-
-    except KeyboardInterrupt:
-        print("\n[!] User interrupted. Stopping.")
-        sys.exit(1)
-
-    # Print summary
-    print("\n=== Summary of Valid Results ===\n")
-    if not valid_results:
-        print("No valid routes found or everything got filtered out.")
+async def main(args=None):
+    if args is None:
+        args = parse_args()
     else:
-        for entry in valid_results:
-            print(f"[+] {entry['url']} => {entry['status_code']} (size: {entry['content_length']})")
-
-    print("\nDone.")
+        args = parse_args(args)
+    
+    # Setup signal handler
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    
+    print(f"[*] Starting web brute force against {args.url}")
+    print(f"[*] Method: {args.method}")
+    print(f"[*] Threads: {args.threads}")
+    
+    generator = WordlistGenerator()
+    
+    # Generate URL paths
+    if args.pattern:
+        paths = list(generator.parse_pattern(args.pattern))
+    elif args.wordlist:
+        with open(args.wordlist) as f:
+            paths = [line.strip() for line in f]
+    
+    # Generate data payloads
+    data_payloads = [None]  # Default no data
+    if args.data_pattern:
+        data_payloads = list(generate_data_payloads(args.data_pattern, generator))
+    elif args.data_wordlist:
+        with open(args.data_wordlist) as f:
+            data_payloads = [json.loads(line.strip()) for line in f]
+    
+    if args.verbose:
+        print(f"[*] Generated {len(paths)} paths to test")
+    
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        with tqdm(total=len(paths), desc="Progress", disable=not args.verbose) as pbar:
+            for path in paths:
+                for data in data_payloads:
+                    # Update URL construction with prefix/suffix
+                    url = f"{args.url}/{args.prefix}{path}{args.suffix}"
+                    task = asyncio.create_task(make_request(session, url, 
+                                                          method=args.method, data=data))
+                    tasks.append(task)
+                    if args.verbose:
+                        print(f"[+] Testing: {url} with data: {data}")
+                    
+            results = await asyncio.gather(*tasks)
+            for result in results:
+                if result:
+                    pbar.update(1)
+                    if args.verbose:
+                        print(f"[+] Found: {result['url']} "
+                              f"(Status: {result['status']}, "
+                              f"Length: {result['length']})")
+    return results  # Add return for test validation
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n[!] Error: {str(e)}")
+        sys.exit(1)
 

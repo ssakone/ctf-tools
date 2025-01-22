@@ -2,5 +2,10 @@ netifaces
 tabulate
 scapy
 requests
-tqdm
+tqdm==4.66.1
 rich
+aiohttp==3.9.1
+flask==3.0.0
+pytest==8.3.4
+colorama==0.4.6
+pytest-asyncio
