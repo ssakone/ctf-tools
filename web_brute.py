@@ -8,23 +8,54 @@ import requests
 import colorama
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
+import json
+from typing import Dict, Optional, Iterator
+import aiohttp
+import itertools
+import string
+import re
+import asyncio
 
 colorama.init()  # For Windows ANSI color support
 
 GREEN = "\033[92m"
 RESET = "\033[0m"
 
+class WordlistGenerator:
+    def __init__(self):
+        self.charsets = {
+            'a': string.ascii_lowercase,
+            'A': string.ascii_uppercase,
+            'd': string.digits,
+            's': string.punctuation
+        }
+    
+    def parse_pattern(self, pattern: str) -> Iterator[str]:
+        """Parse patterns like: [a]{3} for 3 lowercase letters"""
+        if not pattern or len(pattern) < 4:  # Minimum pattern: [x]{1}
+            raise ValueError("Invalid pattern format")
+            
+        match = re.match(r'\[([aAds]+)\]\{(\d+)\}', pattern)
+        if not match:
+            raise ValueError("Pattern must be in format: [chars]{length}")
+            
+        chars, length = match.groups()
+        charset = ''.join(self.charsets[c] for c in chars)
+        return (''.join(p) for p in itertools.product(charset, repeat=int(length)))
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Optimized multithreaded brute-forcer for website routes/files, streaming large wordlists."
     )
+    
+    # Create mutually exclusive group for wordlist source
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("-w", "--wordlist", help="Path to wordlist file")
+    source_group.add_argument("-p", "--pattern", help="Pattern for wordlist generation (e.g. [a]{3})")
+    
     parser.add_argument(
         "-u", "--url", required=True,
         help="Base URL, e.g., http://alert.htb/index.php?page="
-    )
-    parser.add_argument(
-        "-w", "--wordlist", required=True,
-        help="Path to the (large) wordlist file."
     )
     parser.add_argument(
         "--prefix", default="",
@@ -38,6 +69,13 @@ def parse_args():
         "-t", "--threads", type=int, default=5,
         help="Number of threads (default: 5)."
     )
+    parser.add_argument("-m", "--method", default="GET", 
+                        choices=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"],
+                        help="HTTP method to use")
+    parser.add_argument("-d", "--data", help="Request body data (JSON format)")
+    parser.add_argument("-H", "--headers", help="Path to headers file (JSON format)")
+    parser.add_argument("--brute-headers", action="store_true", 
+                        help="Enable header bruteforcing")
 
     # -----------------------------
     # FILTERS: Include / Exclude
@@ -140,104 +178,57 @@ def worker(url, filters, verbose=False):
         "reason": reason
     }
 
-def main():
+async def make_request(session, url: str, method: str = "GET", 
+                      data: Optional[Dict] = None, 
+                      headers: Optional[Dict] = None) -> dict:
+    try:
+        async with session.request(method=method, url=url, 
+                                 json=data, headers=headers) as response:
+            content_length = len(await response.read())
+            return {
+                "url": url,
+                "status_code": response.status,
+                "content_length": content_length,
+                "is_valid": response.status != 404
+            }
+    except Exception as e:
+        return {
+            "url": url,
+            "status_code": 0,
+            "content_length": 0,
+            "is_valid": False,
+            "error": str(e)
+        }
+
+async def main():
     args = parse_args()
-
-    # Build filters dict
-    filters = {
-        "inc_status": set(args.include_status),
-        "exc_status": set(args.exclude_status),
-        "inc_size": set(args.include_size),
-        "exc_size": set(args.exclude_size),
-        "inc_contains": args.include_contains,
-        "exc_contains": args.exclude_contains
-    }
-
-    if not os.path.isfile(args.wordlist):
-        print(f"[!] Wordlist not found: {args.wordlist}")
-        sys.exit(1)
-
-    # We'll do a quick pass to count lines so we can show a proper total in tqdm.
-    print("[*] Counting lines in wordlist (one-time pass).")
-    try:
-        total_lines = 0
-        with open(args.wordlist, "r", encoding="utf-8", errors="ignore") as fcount:
-            for _ in fcount:
-                total_lines += 1
-    except KeyboardInterrupt:
-        print("\n[!] User interrupted during counting. Exiting.")
-        sys.exit(1)
-
-    if args.verbose:
-        print(f"[+] Found {total_lines} lines in {args.wordlist}.")
-        print(f"[+] Using {args.threads} threads.")
-        print("[+] Filters:")
-        print(f"    - include status: {filters['inc_status']} | exclude status: {filters['exc_status']}")
-        print(f"    - include size:   {filters['inc_size']}  | exclude size:   {filters['exc_size']}")
-        print(f"    - include substr: {filters['inc_contains']} | exclude substr: {filters['exc_contains']}")
-        print()
-
-    print(f"[*] Starting brute force against: {args.url}")
-    valid_results = []
-
-    # Producer-Consumer approach:
-    # We'll open the file again and stream lines, never queuing
-    # more futures than 'args.threads' at once.
-    try:
-        with ThreadPoolExecutor(max_workers=args.threads) as executor, \
-             open(args.wordlist, "r", encoding="utf-8", errors="ignore") as f, \
-             tqdm(total=total_lines, desc="Processing", unit="URL") as pbar:
-
-            futures = []
-            for line in f:
-                w = line.strip()
-                if not w:
-                    pbar.update(1)
-                    continue
-
-                brute_url = f"{args.url}{args.prefix}{w}{args.suffix}"
-
-                # If we already have 'threads' futures in flight, wait for at least one to finish
-                while len(futures) >= args.threads:
-                    done, not_done = wait(futures, return_when=FIRST_COMPLETED)
-                    for d in done:
-                        res = d.result()
-                        pbar.update(1)
-                        futures.remove(d)  # remove from the main list
-
-                        if res["is_valid"]:
-                            print(f"{GREEN}[+] {res['url']} => {res['status_code']} (size: {res['content_length']}){RESET}")
-                            valid_results.append(res)
-
-                # Submit a new job
-                futures.append(executor.submit(worker, brute_url, filters, args.verbose))
-
-            # After reading all lines, wait for leftover futures
-            while futures:
-                done, not_done = wait(futures, return_when=FIRST_COMPLETED)
-                for d in done:
-                    res = d.result()
-                    pbar.update(1)
-                    futures.remove(d)
-
-                    if res["is_valid"]:
-                        print(f"{GREEN}[+] {res['url']} => {res['status_code']} (size: {res['content_length']}){RESET}")
-                        valid_results.append(res)
-
-    except KeyboardInterrupt:
-        print("\n[!] User interrupted. Stopping.")
-        sys.exit(1)
-
-    # Print summary
-    print("\n=== Summary of Valid Results ===\n")
-    if not valid_results:
-        print("No valid routes found or everything got filtered out.")
+    generator = WordlistGenerator()
+    
+    # Get words iterator based on source
+    if args.wordlist:
+        words = (line.strip() for line in open(args.wordlist, encoding='utf-8'))
     else:
-        for entry in valid_results:
-            print(f"[+] {entry['url']} => {entry['status_code']} (size: {entry['content_length']})")
-
-    print("\nDone.")
+        words = generator.parse_pattern(args.pattern)
+        
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for word in words:
+            if not word:
+                continue
+            url = f"{args.url}{args.prefix}{word}{args.suffix}"
+            tasks.append(make_request(session, url))
+            
+        results = await asyncio.gather(*tasks)
+        # Process results...
 
 if __name__ == "__main__":
-    main()
+    try:
+        # Run async main with proper event loop
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[!] User interrupted. Exiting.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n[!] Error: {e}")
+        sys.exit(1)
 
